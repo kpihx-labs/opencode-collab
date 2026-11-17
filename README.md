@@ -1,104 +1,88 @@
-# opencode-help
+# opencode-collab
 
-Durable, explicitly controlled peer help sessions for OpenCode. A parent opens
-ordinary root sessions, retains exclusive ownership across restarts, directs
-them with immediate `steer` or durable `queue` messages, then archives and
-later resumes them—without deleting OpenCode history.
+Durable, equal-footing peer collaboration for OpenCode. A parent opens ordinary
+root sessions, keeps ownership across restarts, and — the point of this
+plugin — **subscribes to resources instead of polling sessions**. Every peer,
+pane and future resource is the same shape, so one set of verbs covers
+collaboration, cross-session messaging and tmux pane watching.
 
 Derived from the MIT-licensed [opzero1/op-thread](https://github.com/opzero1/op-thread).
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+See `THIRD_PARTY_NOTICES.md`.
 
 ## Safety guarantees
 
 - **No task children:** peers are root OpenCode sessions (`parentID` is absent).
-- **Owner capability:** only the recorded parent session can operate on a peer.
-- **No recursion:** a managed peer cannot open another help peer.
-- **Passive orchestration:** nothing auto-spawns, auto-escalates, or resumes.
+- **Owner capability:** only the recorded parent can archive/resume a peer.
+- **No recursion:** a managed peer cannot open another peer.
+- **Equal footing:** a peer receives its own id, its parent's id and its
+  siblings' ids, and can message any of them directly.
 - **Safe concurrency:** `maxConcurrent` defaults to 8 (validated range 1–32).
-- **Durable queue:** SQLite WAL, transactional claims, retries, and restart recovery.
-- **Non-destructive closure:** `help_close` only archives/detaches. There is no
-  purge or session-delete tool.
-- **Bounded wait:** `help_wait` returns at its configured timeout (max 600s).
+- **Durable queue:** SQLite WAL, transactional claims, retries, restart recovery.
+- **Non-destructive closure:** `collab_close` only archives/detaches, and it
+  tells the peer it was detached so it can stop cleanly.
+- **Non-blocking delivery:** notifications use `promptAsync` + synthetic parts,
+  never the blocking `prompt` endpoint.
 
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `help_open` | Start an owned root peer with an explicit agent and an optional model from the configured allowlist. |
-| `help_list` | Inspect owned active peers; optionally include archived ones. |
-| `help_read` | Read a peer's OpenCode session/messages. |
-| `help_message` | Explicitly `steer` immediately or atomically `queue`. |
-| `help_wait` | Wait a bounded duration for idle/queue failure. |
-| `help_close` | Archive/detach without deleting history. |
-| `help_resume` | Reattach the same archived peer session. |
+| `collab_spawn` | Start 1..N peers at once, non-blocking, with full topology injected. |
+| `collab_open` | Single-peer alias of `collab_spawn`. |
+| `collab_list` | Peers, subscriptions, pane subscriptions, undelivered notices. |
+| `collab_read` | Read any in-scope session's transcript. |
+| `collab_send` | Message a peer, your parent, a sibling, or any in-scope session. |
+| `collab_attach` | Subscribe to `pane:%N` or `session:<id>`, with your own timeout. |
+| `collab_detach` | Drop a subscription. Never touches other subscribers. |
+| `collab_close` | Archive/detach a peer; history intact; the peer is told. |
+| `collab_resume` | Reattach the same durable session. |
+| `collab_defer` / `_list` / `_drop` | OPERATOR ONLY (Ctrl+Enter end-of-turn queue). |
 
-## Model selection: verified direct SDK support
+## Notifications you actually receive
 
-OpenCode SDK **v1.18.26** declares `SessionPromptAsyncData.body.model` as:
+| Event | When |
+| --- | --- |
+| `session.finished` | A subscribed session returned to idle. Carries the last assistant text. |
+| `session.error` | A subscribed session reported an error event. |
+| `session.closed` | A peer was detached or deleted. |
+| `session.spawned` | A peer was created (other subscribers learn about it). |
+| `pane.*` | Completion, foreign input, timeout, lock change, pane gone (tmux side). |
 
-```ts
-{ providerID: string; modelID: string }
-```
+## Addressing scope
 
-`help_open` requires an explicit agent name. The name is passed directly to
-OpenCode's `promptAsync`, which validates it server-side. `models` is a required
-ordered configuration allowlist: omitting `help_open.model` selects its first
-entry; an explicit value must belong to the same list. The selected model is
-persisted and reused on `help_message`.
-
-The plugin injects the live ordered pool—including its default—into the
-`help_open` and `help_list` tool descriptions. `help_list` also returns
-`defaultModel` and `permittedModels`, so an agent can discover the current
-operator-owned options without reading configuration files or relying on a
-duplicated catalog.
-
-There is deliberately **no automatic model fallback**. If an opening prompt
-fails, its peer is archived and the error reports all permitted model IDs; the
-parent explicitly opens another peer with the selected alternative. If a steer
-fails, its peer remains active and the error instructs the parent to close it,
-then open a replacement. A failed durable queue exposes its final OpenCode
-error through `help_wait` with the same permitted-model list.
-
-## Install
-
-Install from npm when published, or add the future plugin line to OpenCode
-configuration (do not add it twice):
-
-```jsonc
-{ "plugin": ["opencode-help"] }
-```
-
-For a local checkout, use its built module or source entry only after `bun install`.
-OpenCode loads plugins at startup; restart OpenCode after configuration changes.
+`collab_send`/`collab_read`/`collab_attach` work when the target is: your peer,
+your parent, your sibling, an attached edge in either direction, or a session
+whose directory contains yours / is contained by yours. Anything else is
+refused with the exact verb that would lift the restriction.
 
 ## Configuration
 
 ```jsonc
 {
-  "plugin": [["opencode-help", {
+  "plugin": [["file://…/opencode-collab/dist/index.js", {
     "maxConcurrent": 8,
     "queueIntervalMs": 250,
-    "idleSettleMs": 500,
+    "safetyTickMs": 30000,
     "models": [
-      "opencode-go/deepseek-v4-pro",
-      "google/gemini-3.1-pro-preview",
-      "opencode-go/deepseek-v4-flash",
-      "opencode-go/mimo-v2.5"
+      "nvidia/nvidia/nemotron-3.5-super-vl-120b-a12b",
+      "nvidia/nvidia/nemotron-3-ultra-550b-a55b"
     ]
   }]]
 }
 ```
 
-The registry defaults to `$XDG_DATA_HOME/opencode-help/registry.sqlite` (or
-`$HOME/.local/share/opencode-help/registry.sqlite`). Set `databasePath` only
-when deliberately isolating a test or deployment.
+The registry defaults to `$XDG_DATA_HOME/opencode-collab/registry.sqlite`.
+`safetyTickMs` is a safety net (retry undelivered notices, kick the queue), not
+a poll loop: normal delivery is event-driven.
 
 ## Development
 
 ```sh
 bun install
-make check
+bun test
+bun run typecheck
+make build
 ```
 
-`make push` pushes the current branch to SSH remotes named `github` and
+`make push` pushes the current branch to the SSH remotes named `github` and
 `gitlab`; no `origin` remote is used.

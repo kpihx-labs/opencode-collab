@@ -4,28 +4,58 @@ import type { ModelSelection } from "./registry.js"
 type Client = PluginInput["client"]
 export type Session = { id: string; parentID?: string; title: string; directory: string; time: { created: number; updated: number } }
 
+/**
+ * Thin adapter over the V1 OpenCode SDK.
+ *
+ * The one rule that matters here: NOTHING in this file may call
+ * `session.prompt`. That endpoint waits for the recipient's whole turn, so a
+ * plugin delivering a notification would block for minutes (and serialize
+ * every other notification behind it). Every delivery is `promptAsync`.
+ */
 export class OpenCodeApi {
   constructor(private readonly client: Client, private readonly directory: string) {}
+
   async create(title: string, signal?: AbortSignal): Promise<Session> {
     return asSession(unwrap(await this.client.session.create({ body: { title }, query: { directory: this.directory }, signal }), "create session"))
   }
+
   async get(sessionID: string, signal?: AbortSignal): Promise<Session> {
     return asSession(unwrap(await this.client.session.get({ path: { id: sessionID }, query: { directory: this.directory }, signal }), "get session"))
   }
+
   async messages(sessionID: string, limit: number, signal?: AbortSignal) {
     return unwrap(await this.client.session.messages({ path: { id: sessionID }, query: { directory: this.directory, limit }, signal }), "read session messages")
   }
+
   async active(signal?: AbortSignal) {
     const statuses = unwrap(await this.client.session.status({ query: { directory: this.directory }, signal }), "read session status")
     if (!isRecord(statuses)) throw new Error("OpenCode SDK returned invalid session statuses")
     return new Set(Object.entries(statuses).filter(([, status]) => isRecord(status) && status.type !== "idle").map(([id]) => id))
   }
 
-  async prompt(input: { sessionID: string; text: string; agent: string; model?: ModelSelection; messageID: string }, signal?: AbortSignal) {
+  /** Durable, non-blocking synthetic note. Never starts a turn on its own terms. */
+  async synthetic(sessionID: string, text: string, signal?: AbortSignal) {
+    unwrap(
+      await this.client.session.promptAsync({
+        path: { id: sessionID },
+        query: { directory: this.directory },
+        body: { messageID: messageID(), parts: [{ type: "text", text, synthetic: true }] },
+        signal,
+      }),
+      "send synthetic note",
+      true,
+    )
+  }
+
+  async prompt(input: { sessionID: string; text: string; agent?: string; model?: ModelSelection; messageID: string }, signal?: AbortSignal) {
     const existing = await this.client.session.message({ path: { id: input.sessionID, messageID: input.messageID }, query: { directory: this.directory }, signal })
     if (existing.data !== undefined) return
     unwrap(await this.client.session.promptAsync({ path: { id: input.sessionID }, query: { directory: this.directory }, body: { messageID: input.messageID, agent: input.agent, model: input.model, parts: [{ type: "text", text: input.text }] }, signal }), "send prompt", true)
   }
+}
+
+export function messageID() {
+  return `msg_${crypto.randomUUID()}`
 }
 
 function unwrap(result: unknown, operation: string, allowEmpty = false): unknown {

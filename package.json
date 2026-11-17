@@ -1,27 +1,74 @@
 {
-  "name": "opencode-help",
-  "version": "0.4.1",
-  "description": "Durable, owner-scoped peer help sessions for OpenCode",
+  "name": "opencode-collab",
+  "version": "1.0.0",
+  "description": "Durable, equal-footing peer collaboration for OpenCode: subscriptions, an event bus, and automatic reports",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    }
   },
-  "files": ["dist", "README.md", "CONTRACT.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+  "files": [
+    "dist",
+    "README.md",
+    "CONTRACT.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun && tsc --emitDeclarationOnly",
+    "build": "bun build ./src/index.ts ./src/tui.ts --outdir ./dist --target bun --external @opentui/core && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "lint": "biome check .",
     "format": "biome format --write ."
   },
-  "keywords": ["opencode", "plugin", "peer-sessions", "orchestration"],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "peer-sessions",
+    "orchestration",
+    "collaboration",
+    "subscriptions"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+ssh://git@github.com/kpihx-labs/opencode-help.git" },
-  "bugs": { "url": "https://github.com/kpihx-labs/opencode-help/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/kpihx-labs/opencode-help.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kpihx-labs/opencode-help/issues"
+  },
   "homepage": "https://github.com/kpihx-labs/opencode-help#readme",
-  "peerDependencies": { "@opencode-ai/plugin": ">=1.18.16" },
-  "devDependencies": { "@biomejs/biome": "^2.2.4", "@opencode-ai/plugin": "^1.18.16", "@types/bun": "^1.3.11", "typescript": "^5.9.3" },
-  "publishConfig": { "access": "public" }
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.16",
+    "@opentui/core": ">=0.4.5"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.4",
+    "@opencode-ai/plugin": "^1.18.16",
+    "@opentui/core": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "solid-js": "1.9.12",
+    "@types/bun": "^1.3.11",
+    "typescript": "^5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }
