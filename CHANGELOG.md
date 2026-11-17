@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.1.0 — 2026-11-18
+
+### OpenCode 2 support (`v2/index.ts`)
+
+The engine is unchanged; a V2 host adapts it. Nothing about peer lifecycles,
+notices, subscriptions or pane ownership was rewritten, so both hosts run the
+same code and cannot drift.
+
+- `ctx.tool.transform(editor.add)` — the twelve `collab_*` tools are exposed from
+  the existing zod schemas (`z.toJSONSchema`, `$schema` stripped).
+- `ctx.event.subscribe` — the active-session set is now **event-driven** from
+  `session.execution.started|succeeded|failed` (V1 leased it from `session.status`),
+  which removes the lease heuristic and one polling window.
+- `session.idle` / `session.error` are reconstructed from
+  `session.execution.succeeded` / `session.execution.failed`, so the engine's
+  completion logic is untouched.
+- `ctx.session.hook("prompt")` replaces the `chat.message` hook; pending notices
+  are prepended to the admitted prompt text.
+- A `client.session.*` shim maps the V1 SDK calls onto `ctx.session.*`
+  (`create`, `get`, `context`, `synthetic`, `prompt`). Sessions are normalized to
+  the V1 shape `{id, title, directory, time}`, which `asSession` validates.
+- Tool execution receives the caller's `directory` from the plugin location
+  (V2 does not put it on the tool context) — without it, `registry.add` inserted a
+  NULL `peer.directory` and every spawn failed with a NOT NULL constraint.
+
 ## 1.0.0 — 2026-11-13
 
 Renamed from `opencode-help` to `opencode-collab`: the plugin no longer models a
