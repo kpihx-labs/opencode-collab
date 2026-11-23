@@ -64,18 +64,18 @@ describe("durable lifecycle registry", () => {
 describe("subscription bus", () => {
   test("subscriptions are idempotent and keep their own timeout", () => {
     const db = makeRegistry()
-    expect(db.subscribe("pane:%3", "ses_a", "*", 30)).toBe(true)
-    expect(db.subscribe("pane:%3", "ses_a", "*", 60)).toBe(false)
-    expect(db.subscriptions("pane:%3")).toEqual([{ resource: "pane:%3", sessionID: "ses_a", kinds: "*", timeoutS: 60, nextAt: expect.any(Number), createdAt: expect.any(Number) }])
-    expect(db.timeoutOf("pane:%3", "ses_a")).toBe(60)
+    expect(db.subscribe("session:ses_watched", "ses_a", "*", 30)).toBe(true)
+    expect(db.subscribe("session:ses_watched", "ses_a", "*", 60)).toBe(false)
+    expect(db.subscriptions("session:ses_watched")).toEqual([{ resource: "session:ses_watched", sessionID: "ses_a", kinds: "*", timeoutS: 60, nextAt: expect.any(Number), createdAt: expect.any(Number) }])
+    expect(db.timeoutOf("session:ses_watched", "ses_a")).toBe(60)
   })
 
   test("two agents can watch the same resource with different patience", () => {
     const db = makeRegistry()
-    db.subscribe("pane:%3", "ses_a", "*", 0)
-    db.subscribe("pane:%3", "ses_b", "*", 5)
-    expect(db.subscribers("pane:%3")).toEqual(["ses_a", "ses_b"])
-    expect(db.due("pane:%3", Date.now() + 60_000).map((sub) => sub.sessionID)).toEqual(["ses_b"])
+    db.subscribe("session:ses_watched", "ses_a", "*", 0)
+    db.subscribe("session:ses_watched", "ses_b", "*", 5)
+    expect(db.subscribers("session:ses_watched")).toEqual(["ses_a", "ses_b"])
+    expect(db.due("session:ses_watched", Date.now() + 60_000).map((sub) => sub.sessionID)).toEqual(["ses_b"])
   })
 
   test("recipients honour the filter and the actor exclusion", () => {
@@ -102,10 +102,10 @@ describe("subscription bus", () => {
 
   test("unsubscribing one agent never touches the others", () => {
     const db = makeRegistry()
-    db.subscribe("pane:%3", "ses_a")
-    db.subscribe("pane:%3", "ses_b")
-    expect(db.unsubscribe("pane:%3", "ses_a")).toBe(true)
-    expect(db.subscribers("pane:%3")).toEqual(["ses_b"])
+    db.subscribe("session:ses_watched", "ses_a")
+    db.subscribe("session:ses_watched", "ses_b")
+    expect(db.unsubscribe("session:ses_watched", "ses_a")).toBe(true)
+    expect(db.subscribers("session:ses_watched")).toEqual(["ses_b"])
   })
 })
 

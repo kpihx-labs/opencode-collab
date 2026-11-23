@@ -354,7 +354,7 @@ describe("scope and collaboration", () => {
     const { hooks } = await plugin()
     const attach = hooks.tool?.collab_attach
     if (!attach) throw new Error("collab_attach is unavailable")
-    await expect(attach.execute({ resource: "window:1" }, context as never)).rejects.toThrow('Use "pane:%N" or "session:<id>"')
+    await expect(attach.execute({ resource: "window:1" }, context as never)).rejects.toThrow('Use "session:<id>"')
     await hooks.dispose?.()
   })
 
@@ -390,15 +390,6 @@ describe("operator escape hatch", () => {
   })
 })
 
-describe("pane subscription format", () => {
-  test("parses the tmux option encoding used by both plugins", async () => {
-    const { parsePaneSubs } = await import("../src/index.js")
-    expect(parsePaneSubs("ses_a:30,ses_b:0")).toEqual([{ sessionID: "ses_a", timeoutS: 30 }, { sessionID: "ses_b", timeoutS: 0 }])
-    expect(parsePaneSubs("")).toEqual([])
-    expect(parsePaneSubs("ses_a")).toEqual([{ sessionID: "ses_a", timeoutS: 0 }])
-    expect(parsePaneSubs(" , ses_a:120 ,")).toEqual([{ sessionID: "ses_a", timeoutS: 120 }])
-  })
-})
 describe("session-side timeouts", () => {
   test("a subscription timeout re-notifies only while the target is genuinely busy", async () => {
     let busy = true

@@ -2,9 +2,8 @@
 
 Durable, equal-footing peer collaboration for OpenCode. A parent opens ordinary
 root sessions, keeps ownership across restarts, and — the point of this
-plugin — **subscribes to resources instead of polling sessions**. Every peer,
-pane and future resource is the same shape, so one set of verbs covers
-collaboration, cross-session messaging and tmux pane watching.
+plugin — **subscribes to session resources instead of polling**. (Tmux pane
+watching and execution live in the dedicated `opencode-tmux` plugin.)
 
 Derived from the MIT-licensed [opzero1/op-thread](https://github.com/opzero1/op-thread).
 See `THIRD_PARTY_NOTICES.md`.
@@ -29,10 +28,10 @@ See `THIRD_PARTY_NOTICES.md`.
 | --- | --- |
 | `collab_spawn` | Start 1..N peers at once, non-blocking, with full topology injected. |
 | `collab_open` | Single-peer alias of `collab_spawn`. |
-| `collab_list` | Peers, subscriptions, pane subscriptions, undelivered notices. |
+| `collab_list` | Peers, session subscriptions, undelivered notices. |
 | `collab_read` | Read any in-scope session's transcript. |
 | `collab_send` | Message a peer, your parent, a sibling, or any in-scope session. |
-| `collab_attach` | Subscribe to `pane:%N` or `session:<id>`, with your own timeout. |
+| `collab_attach` | Subscribe to `session:<id>`, with your own timeout. |
 | `collab_detach` | Drop a subscription. Never touches other subscribers. |
 | `collab_close` | Archive/detach a peer; history intact; the peer is told. |
 | `collab_resume` | Reattach the same durable session. |
@@ -46,7 +45,6 @@ See `THIRD_PARTY_NOTICES.md`.
 | `session.error` | A subscribed session reported an error event. |
 | `session.closed` | A peer was detached or deleted. |
 | `session.spawned` | A peer was created (other subscribers learn about it). |
-| `pane.*` | Completion, foreign input, timeout, lock change, pane gone (tmux side). |
 
 ## Addressing scope
 

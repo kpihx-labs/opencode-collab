@@ -19,15 +19,10 @@ export type Peer = {
 }
 
 /**
- * Subscription: "session X wants to hear about resource R".
- *
- * The resource is the unit of interest, never the writer. A tmux pane
- * (`pane:%3`), a session (`session:ses_…`), or any future resource is the same
- * shape, so one verb covers panes, peers and cross-agent interest.
+ * Subscription: "session X wants to hear about session resource R".
  *
  * `nextAt` is the per-subscriber deadline of its own timeout. Timeouts belong to
- * the SUBSCRIBER, not to the resource: two agents may watch the same pane with
- * two different patience levels, which a per-pane lease can never express.
+ * the SUBSCRIBER, not to the target session. (Tmux panes live in `opencode-tmux`.)
  */
 export type Subscription = {
   resource: string
@@ -268,9 +263,8 @@ export class CollabRegistry {
   /**
    * Every session subscription whose own timeout expired.
    *
-   * Pane timeouts are fired by the tmux half of the bus (it owns `pane:%N`);
-   * this is the session half, which is why the filter is on the resource prefix
-   * rather than on a separate table. One query, no per-resource loop.
+   * Tmux pane timeouts belong to `opencode-tmux`; `opencode-collab` owns
+   * `session:*` subscriptions in SQLite. One query, no per-resource loop.
    */
   dueSessions(now = Date.now()): Subscription[] {
     return this.#conn.query<Record<string, unknown>, Bindings>(

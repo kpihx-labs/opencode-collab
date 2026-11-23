@@ -3,7 +3,7 @@ import * as server from "../src/index.js"
 
 test("server entry never exports or imports the TUI module", async () => {
   expect("tui" in server).toBe(false)
-  expect(Object.keys(server).sort()).toEqual(["default", "opencodeCollab", "parsePaneSubs"])
+  expect(Object.keys(server).sort()).toEqual(["default", "opencodeCollab"])
   const source = await Bun.file(new URL("../src/index.ts", import.meta.url)).text()
   expect(source).not.toContain('from "./tui.js"')
 })

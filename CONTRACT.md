@@ -26,12 +26,9 @@ Resources:
 
 | Resource | Backend | Why |
 | --- | --- | --- |
-| `pane:%N` | tmux pane option `@collab_subs` | Panes belong to tmux. Every OpenCode process, present or future, reads the same list with no IPC, and it survives a plugin restart. |
 | `session:ses_…` | SQLite `sub` table | Sessions belong to one OpenCode server. |
 
-Subscription format for panes: `ses_a:30,ses_b:0` — one entry per subscriber,
-carrying **that subscriber's own timeout**. Two agents may watch the same pane
-with two different patience levels; a per-pane lease can never express that.
+*(Tmux pane resources `pane:%N` and their `@collab_subs` option belong exclusively to the dedicated `opencode-tmux` plugin — zero cross-plugin dependency.)*
 
 ## Delivery guarantees
 
@@ -63,11 +60,11 @@ with two different patience levels; a per-pane lease can never express that.
 ## Timeouts
 
 Timeouts belong to the subscriber: `collab_attach({ resource, timeout_s })`
-re-notifies at that interval while the resource stays busy. `0` means "report
-real transitions only". Both halves are implemented: the tmux side in
-`@collab_subs`, the session side in `sub.next_at` (fired by the 30 s safety
+re-notifies at that interval while the session stays busy. `0` means "report
+real transitions only". Stored in SQLite `sub.next_at` (fired by the 30 s safety
 tick, only while the target is genuinely busy, deadline advanced whether or not
-it fires so a stuck session cannot accumulate a backlog).
+it fires so a stuck session cannot accumulate a backlog). (Pane timeouts are
+owned independently by `opencode-tmux`.)
 
 ## Non-goals
 

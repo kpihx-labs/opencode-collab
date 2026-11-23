@@ -73,11 +73,11 @@ describe("native Collab sidebar rendering", () => {
   test("peers and subscriptions render inside a native text node", async () => {
     const s = await setup()
     s.db.add(peer("ses_peer_1"))
-    s.db.subscribe("pane:%3", "parent-a", "*", 30)
+    s.db.subscribe("session:ses_other", "parent-a", "*", 30)
     const frame = await s.show()
     expect(frame).toContain("Collab (1 peers, 1 subs)")
     expect(frame).toContain("[checker] test-model")
-    expect(frame).toContain("pane:%3")
+    expect(frame).toContain("session:ses_other")
     expect(frame).toContain("@30s")
   })
 
