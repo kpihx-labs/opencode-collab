@@ -224,33 +224,46 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
       return ""
     }
 
-    async function announceFinish(peer: Peer, reason: "idle" | "error", detail?: string, prefetchedMessages?: unknown) {
+    async function announceFinish(
+      target: { sessionID: string; agent?: string; model?: ModelSelection; isPeer?: boolean },
+      reason: "idle" | "error",
+      detail?: string,
+      prefetchedMessages?: unknown,
+    ) {
       let summary = ""
       if (reason === "idle") {
         try {
-          const messages = prefetchedMessages ?? await api.messages(peer.sessionID, 10, shutdown.signal)
+          const messages = prefetchedMessages ?? await api.messages(target.sessionID, 10, shutdown.signal)
           summary = summaryOf(messages)
         } catch {}
       }
-      const model = modelName(peer.model)
+      const label = target.isPeer === false ? `Session ${target.sessionID}` : `Peer session ${target.sessionID}`
+      const meta = target.agent || target.model
+        ? ` (agent: ${target.agent ?? "session/default"}, model: ${modelName(target.model)})`
+        : ""
       emit(
-        `${SESSION}${peer.sessionID}`,
+        `${SESSION}${target.sessionID}`,
         reason === "idle" ? "session.finished" : "session.error",
-        peer.sessionID,
+        target.sessionID,
         () =>
           `<collab-notify>\n` +
-          `Peer session ${peer.sessionID} (agent: ${peer.agent}, model: ${model}) has ${reason === "idle" ? "RETURNED TO IDLE" : "FAILED"}.\n` +
+          `${label}${meta} has ${reason === "idle" ? "RETURNED TO IDLE" : "FAILED"}.\n` +
           (detail ? `Error: ${detail}\n` : "") +
           (reason === "error"
-            ? `Recovery hint: try varying the model (${permittedModels.join(", ")}) or varying the agent (current: ${peer.agent}).\n`
+            ? `Recovery hint: try varying the model (${permittedModels.join(", ")}) or varying the agent${target.agent ? ` (current: ${target.agent})` : ""}.\n`
             : "") +
           `Result:\n===\n${summary || (reason === "error" ? "(execution failed before producing a final response)" : "(no assistant text yet — it may not have started, or its last turn produced only tool calls)")}\n===\n` +
           `Nothing is required of you: this is the report you subscribed to. Next verbs — ` +
-          `collab_read({ to: "${peer.sessionID}" }) for the full transcript, ` +
-          `collab_send({ to: "${peer.sessionID}", message: "..." }) to steer it, ` +
-          `collab_detach({ resource: "${SESSION}${peer.sessionID}" }) to stop hearing about it.\n` +
+          `collab_read({ to: "${target.sessionID}" }) for the full transcript, ` +
+          `collab_send({ to: "${target.sessionID}", message: "..." }) to steer it, ` +
+          `collab_detach({ resource: "${SESSION}${target.sessionID}" }) to stop hearing about it.\n` +
           `</collab-notify>`,
-        { agent: peer.agent, model, ...(detail ? { error: detail } : {}), summary: summary.slice(0, 500) },
+        {
+          ...(target.agent ? { agent: target.agent } : {}),
+          ...(target.model ? { model: modelName(target.model) } : {}),
+          ...(detail ? { error: detail } : {}),
+          summary: summary.slice(0, 500),
+        },
       )
     }
 
@@ -729,10 +742,13 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
             try { await api.synthetic(sessionID, text) } catch { for (const entry of deferred) registry.enqueueDeferred(sessionID, entry.text) }
           }
 
-          // 2. Peer completion report — event-driven, exactly one per real turn
-          // across all plugin instances sharing the SQLite registry.
+          // 2. Session completion report — event-driven, exactly one per real turn
+          // across all plugin instances sharing the SQLite registry. Covers both
+          // managed peers AND any non-peer session (third-party / subagent) watched
+          // via collab_attach.
           const peer = registry.peerOf(sessionID)
-          if (peer && !peer.archived) {
+          const watched = peer ? !peer.archived : registry.subscribers(`${SESSION}${sessionID}`).length > 0
+          if (watched) {
             let messages: unknown
             let key: string | undefined
             try {
@@ -741,7 +757,12 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
             } catch {}
             if (key !== undefined && lastReported.get(sessionID) !== key && registry.claimReport(sessionID, key)) {
               lastReported.set(sessionID, key)
-              await announceFinish(peer, "idle", undefined, messages)
+              await announceFinish(
+                peer ?? { sessionID, isPeer: false },
+                "idle",
+                undefined,
+                messages,
+              )
             }
           }
 
@@ -752,13 +773,14 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
 
         if (event.type === "session.error" || event.type === "session.deleted") {
           const peer = registry.peerOf(sessionID)
-          if (peer && !peer.archived) {
+          const watched = peer ? !peer.archived : registry.subscribers(`${SESSION}${sessionID}`).length > 0
+          if (watched) {
             if (event.type === "session.deleted") {
               const delKey = `deleted:${sessionID}`
               if (lastReported.get(sessionID) !== delKey && registry.claimReport(sessionID, delKey)) {
                 lastReported.set(sessionID, delKey)
                 emit(`${SESSION}${sessionID}`, "session.closed", sessionID, () =>
-                  `<collab-notify>\nPeer session ${sessionID} was deleted outside this plugin. Its history is gone; nothing more will arrive from it.\n` +
+                  `<collab-notify>\n${peer ? "Peer session" : "Session"} ${sessionID} was deleted outside this plugin. Its history is gone; nothing more will arrive from it.\n` +
                   `Next verb: collab_list({ include_archived: true }) to reconcile your peer list.\n</collab-notify>`,
                 )
               }
@@ -771,7 +793,7 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
               const errKey = eventID ? `error:${eventID}` : undefined
               if (!errKey || (lastReported.get(sessionID) !== errKey && registry.claimReport(sessionID, errKey))) {
                 if (errKey) lastReported.set(sessionID, errKey)
-                await announceFinish(peer, "error", detail)
+                await announceFinish(peer ?? { sessionID, isPeer: false }, "error", detail)
               }
             }
           }

@@ -136,6 +136,9 @@ describe("collaboration edges", () => {
       expect(second.claimReport("peer-1", "msg_1")).toBe(false)
       expect(second.claimReport("peer-1", "msg_2")).toBe(true)
       expect(first.claimReport("peer-1", "msg_2")).toBe(false)
+      // Also works for non-peer sessions watched via collab_attach
+      expect(first.claimReport("external-session", "msg_ext_1")).toBe(true)
+      expect(second.claimReport("external-session", "msg_ext_1")).toBe(false)
     } finally {
       first.close()
       second.close()

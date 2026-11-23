@@ -15,7 +15,7 @@ lint: ## Lint and verify formatting
 build: ## Build distributable plugin
 	bun run build
 check: typecheck lint test build ## Run all project checks
-push: ## Push the current branch to GitHub and GitLab
-	@branch="$$(git branch --show-current)"; for remote in github gitlab; do git push "$$remote" "$$branch"; done
+push: ## Push the current branch to GitLab first, then GitHub
+	@branch="$$(git branch --show-current)"; for remote in gitlab github; do git push "$$remote" "$$branch"; done
 status: ## Show repository status
 	@git status --short --branch

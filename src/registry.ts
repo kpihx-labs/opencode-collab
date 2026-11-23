@@ -114,6 +114,9 @@ export class CollabRegistry {
     this.#db.run(`CREATE TABLE IF NOT EXISTS deferred (
       id TEXT PRIMARY KEY, session_id TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL
     )`)
+    this.#db.run(`CREATE TABLE IF NOT EXISTS session_report (
+      session_id TEXT PRIMARY KEY, last_reported_key TEXT NOT NULL
+    )`)
     this.#db.run("CREATE INDEX IF NOT EXISTS peer_owner ON peer(owner_session_id, archived, created_at)")
     this.#db.run("CREATE INDEX IF NOT EXISTS peer_directory ON peer(directory, archived)")
     this.#db.run("CREATE INDEX IF NOT EXISTS sub_resource ON sub(resource)")
@@ -180,11 +183,20 @@ export class CollabRegistry {
    * Cross-instance compare-and-set deduplication for completion/error reports.
    * Multiple plugin instances (one per OpenCode location) share one SQLite DB;
    * only the first caller to claim `(sessionID, key)` may emit the notice.
+   * Works for both managed peers and any third-party/subagent session watched
+   * via `collab_attach`.
    */
   claimReport(sessionID: string, key: string): boolean {
-    return this.#conn.query(
-      "UPDATE peer SET last_reported_key = $key WHERE session_id = $session AND archived = 0 AND (last_reported_key IS NULL OR last_reported_key != $key)",
-    ).run({ $session: sessionID, $key: key }).changes === 1
+    const res = this.#conn.query(
+      `INSERT INTO session_report (session_id, last_reported_key) VALUES ($session, $key)
+       ON CONFLICT(session_id) DO UPDATE SET last_reported_key = excluded.last_reported_key
+       WHERE session_report.last_reported_key != excluded.last_reported_key`,
+    ).run({ $session: sessionID, $key: key })
+    if (res.changes === 1) {
+      this.#conn.query("UPDATE peer SET last_reported_key = $key WHERE session_id = $session").run({ $session: sessionID, $key: key })
+      return true
+    }
+    return false
   }
 
   active(directory: string, now = Date.now()) {

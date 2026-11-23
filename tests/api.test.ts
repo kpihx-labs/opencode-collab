@@ -181,6 +181,34 @@ describe("collab_spawn", () => {
     expect((errReports[0].body.parts as Array<{ text?: string }>)[0].text).toContain("Recovery hint:")
     await hooks.dispose?.()
   })
+
+  test("collab_attach on a non-peer session receives finished, error and closed notifications", async () => {
+    const { client, prompts } = makeClient({
+      messages: [{ info: { id: "msg_ext_1", role: "assistant" }, parts: [{ type: "text", text: "EXTERNAL_DONE" }] }],
+    })
+    const hooks = await opencodeCollab({ databasePath: ":memory:", queueIntervalMs: 5_000, models: MODELS })({ client, directory: "/work" } as never)
+    const attach = hooks.tool?.collab_attach
+    if (!attach) throw new Error("collab_attach is unavailable")
+
+    await attach.execute({ resource: "session:ses_subagent_99" }, context as never)
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_subagent_99" } } })
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_subagent_99" } } })
+    await hooks.event?.({
+      event: { type: "session.error", properties: { sessionID: "ses_subagent_99", error: "subagent crashed", eventID: "evt_sub_1" } } as never,
+    })
+    await hooks.event?.({ event: { type: "session.deleted", properties: { sessionID: "ses_subagent_99" } } })
+    await Bun.sleep(20)
+
+    const syntheticTexts = prompts
+      .filter((r) => r.path?.id === "ses_parent")
+      .flatMap((r) => (r.body.parts as Array<{ text?: string }>).map((p) => p.text ?? ""))
+
+    expect(syntheticTexts.some((t) => t.includes("Session ses_subagent_99") && t.includes("EXTERNAL_DONE"))).toBe(true)
+    expect(syntheticTexts.filter((t) => t.includes("RETURNED TO IDLE"))).toHaveLength(1)
+    expect(syntheticTexts.some((t) => t.includes("subagent crashed"))).toBe(true)
+    expect(syntheticTexts.some((t) => t.includes("was deleted outside this plugin"))).toBe(true)
+    await hooks.dispose?.()
+  })
 })
 
 describe("notification bus", () => {
