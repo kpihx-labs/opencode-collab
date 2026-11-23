@@ -6,10 +6,17 @@ const MODELS = ["opencode-go/deepseek-v4-pro", "google/gemini-3.1-pro-preview"]
 
 type Captured = { path?: { id: string }; body: Record<string, unknown> }
 
-function makeClient(options: { status?: () => Promise<unknown>; promptAsync?: (request: Captured) => Promise<unknown>; created?: string[]; messages?: unknown } = {}) {
+function makeClient(options: {
+  status?: () => Promise<unknown>
+  promptAsync?: (request: Captured) => Promise<unknown>
+  created?: string[]
+  messages?: unknown
+  agents?: Array<{ id: string; name?: string; mode?: string; hidden?: boolean }>
+} = {}) {
   const prompts: Captured[] = []
   let peerNumber = 0
   const client = {
+    ...(options.agents ? { agent: { list: async () => ({ data: options.agents }) } } : {}),
     session: {
       create: async () => {
         const id = `ses_peer_${++peerNumber}`
@@ -120,6 +127,58 @@ describe("collab_spawn", () => {
     if (!spawn) throw new Error("collab_spawn is unavailable")
     await spawn.execute({ tasks: [{ prompt: "first", agent: "executor" }] }, context as never)
     await expect(spawn.execute({ tasks: [{ prompt: "nested", agent: "executor" }] }, { ...context, sessionID: "ses_peer_1" } as never)).rejects.toThrow("cannot spawn peers")
+    await hooks.dispose?.()
+  })
+
+  test("omitting agent inherits the caller's current agent; invalid agent fails with alternatives", async () => {
+    const { client, prompts } = makeClient({
+      agents: [{ id: "Live" }, { id: "general" }, { id: "executor" }],
+    })
+    const hooks = await opencodeCollab({ databasePath: ":memory:", queueIntervalMs: 5_000, models: MODELS })({ client, directory: "/work" } as never)
+    const open = hooks.tool?.collab_open
+    if (!open) throw new Error("collab_open is unavailable")
+
+    const inherited = JSON.parse(await open.execute({ prompt: "inherit me" }, context as never))
+    expect(inherited.agent).toBe("Live")
+    expect(prompts[0].body.agent).toBe("Live")
+
+    await expect(open.execute({ prompt: "bad", agent: "ghost" }, context as never)).rejects.toThrow("Unknown or unavailable agent")
+    await hooks.dispose?.()
+  })
+
+  test("skips trailing V2 idle marker to include assistant text in <collab-notify> and surfaces error details", async () => {
+    const { client, prompts } = makeClient({
+      messages: [
+        { info: { id: "msg_u1", role: "user" }, parts: [{ type: "text", text: "prompt" }] },
+        { info: { id: "msg_a1", role: "assistant" }, parts: [{ type: "text", text: "REAL_ASSISTANT_ANSWER" }] },
+        { info: { id: "msg_idle", role: "idle" }, parts: [] },
+      ],
+    })
+    const hooks = await opencodeCollab({ databasePath: ":memory:", queueIntervalMs: 5_000, models: MODELS })({ client, directory: "/work" } as never)
+    const open = hooks.tool?.collab_open
+    if (!open) throw new Error("collab_open is unavailable")
+    await open.execute({ prompt: "work", agent: "general" }, context as never)
+
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_peer_1" } } })
+    await hooks.event?.({ event: { type: "session.idle", properties: { sessionID: "ses_peer_1" } } })
+    await Bun.sleep(20)
+
+    const idleReports = prompts.filter((request) =>
+      (request.body.parts as Array<{ text?: string }>).some((p) => p.text?.includes("RETURNED TO IDLE")),
+    )
+    expect(idleReports).toHaveLength(1)
+    expect((idleReports[0].body.parts as Array<{ text?: string }>)[0].text).toContain("REAL_ASSISTANT_ANSWER")
+
+    await hooks.event?.({
+      event: { type: "session.error", properties: { sessionID: "ses_peer_1", error: "model quota exceeded", eventID: "evt_1" } } as never,
+    })
+    await Bun.sleep(20)
+    const errReports = prompts.filter((request) =>
+      (request.body.parts as Array<{ text?: string }>).some((p) => p.text?.includes("FAILED")),
+    )
+    expect(errReports).toHaveLength(1)
+    expect((errReports[0].body.parts as Array<{ text?: string }>)[0].text).toContain("model quota exceeded")
+    expect((errReports[0].body.parts as Array<{ text?: string }>)[0].text).toContain("Recovery hint:")
     await hooks.dispose?.()
   })
 })

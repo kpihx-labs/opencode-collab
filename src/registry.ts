@@ -52,18 +52,35 @@ export type DeferredMessage = { id: string; sessionID: string; text: string; cre
 export type Notice = { id: string; sessionID: string; text: string; seq?: number }
 
 export class CollabRegistry {
-  #db: Database
+  #path: string
+  #db!: Database
+  #closed = false
 
   constructor(path: string) {
-    if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true })
-    this.#db = new Database(path, { create: true })
+    this.#path = path
+    this.#open()
+  }
+
+  get #conn(): Database {
+    if (this.#closed) {
+      if (this.#path === ":memory:") throw new Error("Cannot use a closed in-memory database")
+      this.#open()
+    }
+    return this.#db
+  }
+
+  #open() {
+    if (this.#path !== ":memory:") mkdirSync(dirname(this.#path), { recursive: true })
+    this.#db = new Database(this.#path, { create: true })
+    this.#closed = false
     this.#db.run("PRAGMA journal_mode = WAL")
     this.#db.run("PRAGMA busy_timeout = 5000")
     this.#db.run(`CREATE TABLE IF NOT EXISTS peer (
       owner_session_id TEXT NOT NULL, session_id TEXT PRIMARY KEY, directory TEXT NOT NULL,
       agent TEXT NOT NULL, provider_id TEXT, model_id TEXT, archived INTEGER NOT NULL DEFAULT 0,
-      active_until INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, archived_at INTEGER
+      active_until INTEGER NOT NULL DEFAULT 0, last_reported_key TEXT, created_at INTEGER NOT NULL, archived_at INTEGER
     )`)
+    try { this.#db.run("ALTER TABLE peer ADD COLUMN last_reported_key TEXT") } catch {}
     // The notification relation. `resource` is opaque to this class: callers own
     // the vocabulary (`session:…`, `pane:…`) as long as one contract holds —
     // emitting on a resource notifies every subscriber of that resource.
@@ -112,7 +129,7 @@ export class CollabRegistry {
 
   add(peer: Omit<Peer, "archived" | "createdAt"> & { createdAt?: number }) {
     const createdAt = peer.createdAt ?? Date.now()
-    this.#db.query(`INSERT INTO peer (owner_session_id, session_id, directory, agent, provider_id, model_id, created_at)
+    this.#conn.query(`INSERT INTO peer (owner_session_id, session_id, directory, agent, provider_id, model_id, created_at)
       VALUES ($owner, $session, $directory, $agent, $provider, $model, $created)`).run({
       $owner: peer.ownerSessionID, $session: peer.sessionID, $directory: peer.directory, $agent: peer.agent,
       $provider: peer.model?.providerID ?? null, $model: peer.model?.modelID ?? null, $created: createdAt,
@@ -120,56 +137,67 @@ export class CollabRegistry {
   }
 
   owned(ownerSessionID: string, sessionID: string, includeArchived = false): Peer | undefined {
-    const row = this.#db.query<Record<string, unknown>, Bindings>(
+    const row = this.#conn.query<Record<string, unknown>, Bindings>(
       `SELECT * FROM peer WHERE owner_session_id = $owner AND session_id = $session ${includeArchived ? "" : "AND archived = 0"}`,
     ).get({ $owner: ownerSessionID, $session: sessionID })
     return row === null ? undefined : toPeer(row)
   }
 
   peerOf(sessionID: string, includeArchived = true): Peer | undefined {
-    const row = this.#db.query<Record<string, unknown>, Bindings>(
+    const row = this.#conn.query<Record<string, unknown>, Bindings>(
       `SELECT * FROM peer WHERE session_id = $session ${includeArchived ? "" : "AND archived = 0"}`,
     ).get({ $session: sessionID })
     return row === null ? undefined : toPeer(row)
   }
 
   isManaged(sessionID: string) {
-    return this.#db.query("SELECT 1 FROM peer WHERE session_id = $session").get({ $session: sessionID }) !== null
+    return this.#conn.query("SELECT 1 FROM peer WHERE session_id = $session").get({ $session: sessionID }) !== null
   }
 
   list(ownerSessionID: string, includeArchived = false): Peer[] {
-    return this.#db.query<Record<string, unknown>, Bindings>(
+    return this.#conn.query<Record<string, unknown>, Bindings>(
       `SELECT * FROM peer WHERE owner_session_id = $owner ${includeArchived ? "" : "AND archived = 0"} ORDER BY created_at`,
     ).all({ $owner: ownerSessionID }).map(toPeer)
   }
 
   siblings(ownerSessionID: string, exceptSessionID: string): Peer[] {
-    return this.#db.query<Record<string, unknown>, Bindings>(
+    return this.#conn.query<Record<string, unknown>, Bindings>(
       "SELECT * FROM peer WHERE owner_session_id = $owner AND session_id != $session AND archived = 0 ORDER BY created_at",
     ).all({ $owner: ownerSessionID, $session: exceptSessionID }).map(toPeer)
   }
 
   archive(ownerSessionID: string, sessionID: string) {
-    return this.#db.query("UPDATE peer SET archived = 1, archived_at = $now, active_until = 0 WHERE owner_session_id = $owner AND session_id = $session AND archived = 0")
+    return this.#conn.query("UPDATE peer SET archived = 1, archived_at = $now, active_until = 0 WHERE owner_session_id = $owner AND session_id = $session AND archived = 0")
       .run({ $owner: ownerSessionID, $session: sessionID, $now: Date.now() }).changes === 1
   }
 
   resume(ownerSessionID: string, sessionID: string) {
-    return this.#db.query("UPDATE peer SET archived = 0, archived_at = NULL WHERE owner_session_id = $owner AND session_id = $session AND archived = 1")
+    return this.#conn.query("UPDATE peer SET archived = 0, archived_at = NULL WHERE owner_session_id = $owner AND session_id = $session AND archived = 1")
       .run({ $owner: ownerSessionID, $session: sessionID }).changes === 1
   }
 
+  /**
+   * Cross-instance compare-and-set deduplication for completion/error reports.
+   * Multiple plugin instances (one per OpenCode location) share one SQLite DB;
+   * only the first caller to claim `(sessionID, key)` may emit the notice.
+   */
+  claimReport(sessionID: string, key: string): boolean {
+    return this.#conn.query(
+      "UPDATE peer SET last_reported_key = $key WHERE session_id = $session AND archived = 0 AND (last_reported_key IS NULL OR last_reported_key != $key)",
+    ).run({ $session: sessionID, $key: key }).changes === 1
+  }
+
   active(directory: string, now = Date.now()) {
-    return this.#db.query<{ session_id: string }, Bindings>("SELECT session_id FROM peer WHERE directory = $directory AND archived = 0 AND active_until > $now")
+    return this.#conn.query<{ session_id: string }, Bindings>("SELECT session_id FROM peer WHERE directory = $directory AND archived = 0 AND active_until > $now")
       .all({ $directory: directory, $now: now }).map((row) => row.session_id)
   }
 
   markActive(sessionIDs: Iterable<string>, directory: string, until: number) {
-    const update = this.#db.query("UPDATE peer SET active_until = $until WHERE session_id = $session AND directory = $directory AND archived = 0")
-    this.#db.transaction(() => {
+    const update = this.#conn.query("UPDATE peer SET active_until = $until WHERE session_id = $session AND directory = $directory AND archived = 0")
+    this.#conn.transaction(() => {
       for (const sessionID of Array.from(sessionIDs)) {
         update.run({ $session: sessionID, $directory: directory, $until: until })
-        this.#db.query("UPDATE sub SET seen_active = 1 WHERE session_id = $session").run({ $session: sessionID })
+        this.#conn.query("UPDATE sub SET seen_active = 1 WHERE session_id = $session").run({ $session: sessionID })
       }
     })()
   }
@@ -179,28 +207,28 @@ export class CollabRegistry {
   subscribe(resource: string, sessionID: string, kinds = "*", timeoutS = 0) {
     const now = Date.now()
     const nextAt = timeoutS > 0 ? now + timeoutS * 1000 : 0
-    const existing = this.#db.query<Record<string, unknown>, Bindings>(
+    const existing = this.#conn.query<Record<string, unknown>, Bindings>(
       "SELECT * FROM sub WHERE resource = $resource AND session_id = $session",
     ).get({ $resource: resource, $session: sessionID })
     if (existing) {
       // Idempotent: re-attaching only upgrades the filter/timeout, never creates
       // a duplicate notification stream.
-      this.#db.query("UPDATE sub SET kinds = $kinds, timeout_s = $timeout, next_at = $next WHERE resource = $resource AND session_id = $session")
+      this.#conn.query("UPDATE sub SET kinds = $kinds, timeout_s = $timeout, next_at = $next WHERE resource = $resource AND session_id = $session")
         .run({ $resource: resource, $session: sessionID, $kinds: kinds, $timeout: timeoutS, $next: nextAt })
       return false
     }
-    this.#db.query("INSERT INTO sub (resource, session_id, kinds, timeout_s, next_at, created_at) VALUES ($resource, $session, $kinds, $timeout, $next, $now)")
+    this.#conn.query("INSERT INTO sub (resource, session_id, kinds, timeout_s, next_at, created_at) VALUES ($resource, $session, $kinds, $timeout, $next, $now)")
       .run({ $resource: resource, $session: sessionID, $kinds: kinds, $timeout: timeoutS, $next: nextAt, $now: now })
     return true
   }
 
   unsubscribe(resource: string, sessionID: string) {
-    return this.#db.query("DELETE FROM sub WHERE resource = $resource AND session_id = $session")
+    return this.#conn.query("DELETE FROM sub WHERE resource = $resource AND session_id = $session")
       .run({ $resource: resource, $session: sessionID }).changes === 1
   }
 
   unsubscribeSession(sessionID: string) {
-    return this.#db.query("DELETE FROM sub WHERE session_id = $session").run({ $session: sessionID }).changes
+    return this.#conn.query("DELETE FROM sub WHERE session_id = $session").run({ $session: sessionID }).changes
   }
 
   subscriptions(resource?: string, sessionID?: string): Subscription[] {
@@ -209,18 +237,18 @@ export class CollabRegistry {
     if (resource !== undefined) { clauses.push("resource = $resource"); params.$resource = resource }
     if (sessionID !== undefined) { clauses.push("session_id = $session"); params.$session = sessionID }
     const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""
-    return this.#db.query<Record<string, unknown>, Bindings>(`SELECT * FROM sub ${where} ORDER BY resource, created_at`)
+    return this.#conn.query<Record<string, unknown>, Bindings>(`SELECT * FROM sub ${where} ORDER BY resource, created_at`)
       .all(params).map(toSubscription)
   }
 
   subscribers(resource: string): string[] {
-    return this.#db.query<{ session_id: string }, Bindings>("SELECT session_id FROM sub WHERE resource = $resource ORDER BY created_at")
+    return this.#conn.query<{ session_id: string }, Bindings>("SELECT session_id FROM sub WHERE resource = $resource ORDER BY created_at")
       .all({ $resource: resource }).map((row) => row.session_id)
   }
 
   /** Subscribers whose own timeout expired. Emitting belongs to the caller. */
   due(resource: string, now = Date.now()): Subscription[] {
-    return this.#db.query<Record<string, unknown>, Bindings>(
+    return this.#conn.query<Record<string, unknown>, Bindings>(
       "SELECT * FROM sub WHERE resource = $resource AND timeout_s > 0 AND next_at > 0 AND next_at <= $now",
     ).all({ $resource: resource, $now: now }).map(toSubscription)
   }
@@ -233,18 +261,18 @@ export class CollabRegistry {
    * rather than on a separate table. One query, no per-resource loop.
    */
   dueSessions(now = Date.now()): Subscription[] {
-    return this.#db.query<Record<string, unknown>, Bindings>(
+    return this.#conn.query<Record<string, unknown>, Bindings>(
       "SELECT * FROM sub WHERE timeout_s > 0 AND next_at > 0 AND next_at <= $now AND resource LIKE 'session:%'",
     ).all({ $now: now }).map(toSubscription)
   }
 
   advanceTimeout(resource: string, sessionID: string) {
-    this.#db.query("UPDATE sub SET next_at = $next WHERE resource = $resource AND session_id = $session AND timeout_s > 0")
+    this.#conn.query("UPDATE sub SET next_at = $next WHERE resource = $resource AND session_id = $session AND timeout_s > 0")
       .run({ $resource: resource, $session: sessionID, $next: Date.now() + this.timeoutOf(resource, sessionID) * 1000 })
   }
 
   timeoutOf(resource: string, sessionID: string) {
-    const row = this.#db.query<{ timeout_s: number }, Bindings>(
+    const row = this.#conn.query<{ timeout_s: number }, Bindings>(
       "SELECT timeout_s FROM sub WHERE resource = $resource AND session_id = $session",
     ).get({ $resource: resource, $session: sessionID })
     return Number(row?.timeout_s ?? 0)
@@ -255,7 +283,7 @@ export class CollabRegistry {
   emit(event: { resource: string; kind: string; actor?: string; payload?: unknown }): CollabEvent {
     const now = Date.now()
     const payload = event.payload === undefined ? null : JSON.stringify(event.payload)
-    const result = this.#db.query(
+    const result = this.#conn.query(
       "INSERT INTO event (resource, kind, actor, payload, ts) VALUES ($resource, $kind, $actor, $payload, $now)",
     ).run({ $resource: event.resource, $kind: event.kind, $actor: event.actor ?? null, $payload: payload, $now: now })
     return {
@@ -274,13 +302,13 @@ export class CollabRegistry {
 
   notify(sessionID: string, resource: string, text: string, seq?: number) {
     const id = `ntf_${crypto.randomUUID()}`
-    this.#db.query("INSERT INTO notify (id, session_id, resource, seq, text, created_at) VALUES ($id, $session, $resource, $seq, $text, $now)")
+    this.#conn.query("INSERT INTO notify (id, session_id, resource, seq, text, created_at) VALUES ($id, $session, $resource, $seq, $text, $now)")
       .run({ $id: id, $session: sessionID, $resource: resource, $seq: seq ?? null, $text: text, $now: Date.now() })
     return id
   }
 
   pendingNotices(sessionID: string, limit = 40): Notice[] {
-    return this.#db.query<Record<string, unknown>, Bindings>(
+    return this.#conn.query<Record<string, unknown>, Bindings>(
       "SELECT * FROM notify WHERE session_id = $session AND delivered_at IS NULL ORDER BY created_at LIMIT $limit",
     ).all({ $session: sessionID, $limit: limit }).map((row) => ({
       id: String(row.id), sessionID: String(row.session_id), text: String(row.text),
@@ -290,12 +318,12 @@ export class CollabRegistry {
 
   markDelivered(ids: string[]) {
     if (ids.length === 0) return
-    const statement = this.#db.query("UPDATE notify SET delivered_at = $now WHERE id = $id")
-    this.#db.transaction(() => { for (const id of ids) statement.run({ $id: id, $now: Date.now() }) })()
+    const statement = this.#conn.query("UPDATE notify SET delivered_at = $now WHERE id = $id")
+    this.#conn.transaction(() => { for (const id of ids) statement.run({ $id: id, $now: Date.now() }) })()
   }
 
   sessionsWithNotices(): string[] {
-    return this.#db.query<{ session_id: string }, Bindings>(
+    return this.#conn.query<{ session_id: string }, Bindings>(
       "SELECT DISTINCT session_id FROM notify WHERE delivered_at IS NULL",
     ).all({}).map((row) => row.session_id)
   }
@@ -304,13 +332,13 @@ export class CollabRegistry {
 
   enqueueDeferred(sessionID: string, text: string) {
     const id = `def_${crypto.randomUUID()}`
-    this.#db.query("INSERT INTO deferred (id, session_id, text, created_at) VALUES ($id, $session, $text, $now)")
+    this.#conn.query("INSERT INTO deferred (id, session_id, text, created_at) VALUES ($id, $session, $text, $now)")
       .run({ $id: id, $session: sessionID, $text: text, $now: Date.now() })
     return id
   }
 
   listDeferred(sessionID: string): DeferredMessage[] {
-    return this.#db.query<{ id: string; session_id: string; text: string; created_at: number }, Bindings>(
+    return this.#conn.query<{ id: string; session_id: string; text: string; created_at: number }, Bindings>(
       "SELECT id, session_id, text, created_at FROM deferred WHERE session_id = $session ORDER BY created_at",
     ).all({ $session: sessionID }).map((row) => ({
       id: row.id, sessionID: row.session_id, text: row.text, createdAt: Number(row.created_at),
@@ -318,48 +346,48 @@ export class CollabRegistry {
   }
 
   drainDeferred(sessionID: string): DeferredMessage[] {
-    return this.#db.transaction(() => {
+    return this.#conn.transaction(() => {
       const items = this.listDeferred(sessionID)
-      if (items.length > 0) this.#db.query("DELETE FROM deferred WHERE session_id = $session").run({ $session: sessionID })
+      if (items.length > 0) this.#conn.query("DELETE FROM deferred WHERE session_id = $session").run({ $session: sessionID })
       return items
     })()
   }
 
   dequeueDeferred(id: string): boolean {
-    return this.#db.query("DELETE FROM deferred WHERE id = $id").run({ $id: id }).changes > 0
+    return this.#conn.query("DELETE FROM deferred WHERE id = $id").run({ $id: id }).changes > 0
   }
 
   // ---- concurrency ---------------------------------------------------------
 
   admit(ownerSessionID: string, max: number, expiresAt: number) {
-    return this.#db.transaction(() => {
+    return this.#conn.transaction(() => {
       const now = Date.now()
-      this.#db.query("DELETE FROM admission WHERE expires_at <= $now").run({ $now: now })
-      const active = this.#db.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM peer WHERE owner_session_id = $owner AND archived = 0 AND active_until > $now")
+      this.#conn.query("DELETE FROM admission WHERE expires_at <= $now").run({ $now: now })
+      const active = this.#conn.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM peer WHERE owner_session_id = $owner AND archived = 0 AND active_until > $now")
         .get({ $owner: ownerSessionID, $now: now })?.count ?? 0
-      const pending = this.#db.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM admission WHERE owner_session_id = $owner AND expires_at > $now")
+      const pending = this.#conn.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM admission WHERE owner_session_id = $owner AND expires_at > $now")
         .get({ $owner: ownerSessionID, $now: now })?.count ?? 0
       if (active + pending >= max) return undefined
       const id = crypto.randomUUID()
-      this.#db.query("INSERT INTO admission (id, owner_session_id, expires_at) VALUES ($id, $owner, $expires)").run({ $id: id, $owner: ownerSessionID, $expires: expiresAt })
+      this.#conn.query("INSERT INTO admission (id, owner_session_id, expires_at) VALUES ($id, $owner, $expires)").run({ $id: id, $owner: ownerSessionID, $expires: expiresAt })
       return id
     })()
   }
 
-  releaseAdmission(id: string) { this.#db.query("DELETE FROM admission WHERE id = $id").run({ $id: id }) }
+  releaseAdmission(id: string) { this.#conn.query("DELETE FROM admission WHERE id = $id").run({ $id: id }) }
 
   reserve(ownerSessionID: string, sessionID: string, max: number, until: number) {
-    return this.#db.transaction(() => {
+    return this.#conn.transaction(() => {
       const peer = this.owned(ownerSessionID, sessionID)
       if (!peer) return false
       const now = Date.now()
-      const current = this.#db.query<{ active_until: number }, Bindings>("SELECT active_until FROM peer WHERE session_id = $session").get({ $session: sessionID })
+      const current = this.#conn.query<{ active_until: number }, Bindings>("SELECT active_until FROM peer WHERE session_id = $session").get({ $session: sessionID })
       if (!current || current.active_until <= now) {
-        const count = this.#db.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM peer WHERE owner_session_id = $owner AND session_id != $session AND archived = 0 AND active_until > $now")
+        const count = this.#conn.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM peer WHERE owner_session_id = $owner AND session_id != $session AND archived = 0 AND active_until > $now")
           .get({ $owner: ownerSessionID, $session: sessionID, $now: now })?.count ?? 0
         if (count >= max) return false
       }
-      this.#db.query("UPDATE peer SET active_until = $until WHERE session_id = $session").run({ $session: sessionID, $until: until })
+      this.#conn.query("UPDATE peer SET active_until = $until WHERE session_id = $session").run({ $session: sessionID, $until: until })
       return true
     })()
   }
@@ -368,7 +396,7 @@ export class CollabRegistry {
 
   enqueue(message: Omit<QueuedMessage, "attempts">) {
     const now = Date.now()
-    this.#db.query(`INSERT INTO queue (id, owner_session_id, session_id, text, agent, provider_id, model_id, next_attempt_at, created_at)
+    this.#conn.query(`INSERT INTO queue (id, owner_session_id, session_id, text, agent, provider_id, model_id, next_attempt_at, created_at)
       VALUES ($id, $owner, $session, $text, $agent, $provider, $model, $now, $now)`).run({
       $id: message.id, $owner: message.ownerSessionID, $session: message.sessionID, $text: message.text, $agent: message.agent,
       $provider: message.model?.providerID ?? null, $model: message.model?.modelID ?? null, $now: now,
@@ -376,45 +404,49 @@ export class CollabRegistry {
   }
 
   pending(directory: string, now = Date.now()): QueuedMessage[] {
-    this.#db.query("UPDATE queue SET state = CASE WHEN attempts >= 7 THEN 'failed' ELSE 'pending' END, attempts = attempts + 1, claimed_at = NULL WHERE state = 'sending' AND claimed_at < $stale")
+    this.#conn.query("UPDATE queue SET state = CASE WHEN attempts >= 7 THEN 'failed' ELSE 'pending' END, attempts = attempts + 1, claimed_at = NULL WHERE state = 'sending' AND claimed_at < $stale")
       .run({ $stale: now - 60_000 })
-    return this.#db.query<Record<string, unknown>, Bindings>(`SELECT q.* FROM queue q JOIN peer p ON p.session_id = q.session_id
+    return this.#conn.query<Record<string, unknown>, Bindings>(`SELECT q.* FROM queue q JOIN peer p ON p.session_id = q.session_id
       WHERE q.state = 'pending' AND q.next_attempt_at <= $now AND p.directory = $directory AND p.archived = 0 ORDER BY q.created_at`)
       .all({ $directory: directory, $now: now }).map(toQueued)
   }
 
   claim(id: string, max: number, until: number) {
-    return this.#db.transaction(() => {
-      const row = this.#db.query<{ owner_session_id: string; session_id: string; active_until: number }, Bindings>("SELECT q.owner_session_id, q.session_id, p.active_until FROM queue q JOIN peer p ON p.session_id = q.session_id WHERE q.id = $id AND q.state = 'pending' AND p.archived = 0").get({ $id: id })
+    return this.#conn.transaction(() => {
+      const row = this.#conn.query<{ owner_session_id: string; session_id: string; active_until: number }, Bindings>("SELECT q.owner_session_id, q.session_id, p.active_until FROM queue q JOIN peer p ON p.session_id = q.session_id WHERE q.id = $id AND q.state = 'pending' AND p.archived = 0").get({ $id: id })
       if (!row || Number(row.active_until) > Date.now()) return false
-      const count = this.#db.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM peer WHERE owner_session_id = $owner AND session_id != $session AND archived = 0 AND active_until > $now")
+      const count = this.#conn.query<{ count: number }, Bindings>("SELECT COUNT(*) AS count FROM peer WHERE owner_session_id = $owner AND session_id != $session AND archived = 0 AND active_until > $now")
         .get({ $owner: row.owner_session_id, $session: row.session_id, $now: Date.now() })?.count ?? 0
       if (count >= max) return false
-      if (this.#db.query("UPDATE queue SET state = 'sending', claimed_at = $now WHERE id = $id AND state = 'pending'").run({ $id: id, $now: Date.now() }).changes !== 1) return false
-      this.#db.query("UPDATE peer SET active_until = $until WHERE session_id = $session").run({ $session: row.session_id, $until: until })
+      if (this.#conn.query("UPDATE queue SET state = 'sending', claimed_at = $now WHERE id = $id AND state = 'pending'").run({ $id: id, $now: Date.now() }).changes !== 1) return false
+      this.#conn.query("UPDATE peer SET active_until = $until WHERE session_id = $session").run({ $session: row.session_id, $until: until })
       return true
     })()
   }
 
-  sent(id: string) { this.#db.query("UPDATE queue SET state = 'sent', sent_at = $now, claimed_at = NULL, last_error = NULL WHERE id = $id AND state = 'sending'").run({ $id: id, $now: Date.now() }) }
+  sent(id: string) { this.#conn.query("UPDATE queue SET state = 'sent', sent_at = $now, claimed_at = NULL, last_error = NULL WHERE id = $id AND state = 'sending'").run({ $id: id, $now: Date.now() }) }
 
   retry(id: string, attempts: number, error: string) {
     const failed = attempts >= 8
-    this.#db.query("UPDATE queue SET state = $state, attempts = $attempts, next_attempt_at = $next, claimed_at = NULL, last_error = $error WHERE id = $id AND state = 'sending'")
+    this.#conn.query("UPDATE queue SET state = $state, attempts = $attempts, next_attempt_at = $next, claimed_at = NULL, last_error = $error WHERE id = $id AND state = 'sending'")
       .run({ $id: id, $state: failed ? "failed" : "pending", $attempts: attempts, $next: Date.now() + Math.min(30_000, 500 * 2 ** Math.min(attempts, 6)), $error: error })
   }
 
   queueState(sessionID: string): "queued" | "queue_failed" | undefined {
-    const row = this.#db.query<{ state: string }, Bindings>("SELECT state FROM queue WHERE session_id = $session AND state IN ('pending', 'sending', 'failed') ORDER BY CASE WHEN state = 'failed' THEN 1 ELSE 0 END, created_at LIMIT 1").get({ $session: sessionID })
+    const row = this.#conn.query<{ state: string }, Bindings>("SELECT state FROM queue WHERE session_id = $session AND state IN ('pending', 'sending', 'failed') ORDER BY CASE WHEN state = 'failed' THEN 1 ELSE 0 END, created_at LIMIT 1").get({ $session: sessionID })
     return row ? (row.state === "failed" ? "queue_failed" : "queued") : undefined
   }
 
   queueError(sessionID: string) {
-    const row = this.#db.query<{ last_error: string | null }, Bindings>("SELECT last_error FROM queue WHERE session_id = $session AND state = 'failed' ORDER BY created_at DESC LIMIT 1").get({ $session: sessionID })
+    const row = this.#conn.query<{ last_error: string | null }, Bindings>("SELECT last_error FROM queue WHERE session_id = $session AND state = 'failed' ORDER BY created_at DESC LIMIT 1").get({ $session: sessionID })
     return row?.last_error ?? undefined
   }
 
-  close() { this.#db.close() }
+  close() {
+    if (this.#closed) return
+    this.#closed = true
+    try { this.#db.close() } catch {}
+  }
 }
 
 function toPeer(row: Record<string, unknown>): Peer {

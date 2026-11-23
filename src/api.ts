@@ -3,6 +3,7 @@ import type { ModelSelection } from "./registry.js"
 
 type Client = PluginInput["client"]
 export type Session = { id: string; parentID?: string; title: string; directory: string; time: { created: number; updated: number } }
+export type AgentSummary = { id: string; name?: string; mode?: string; hidden?: boolean }
 
 /**
  * Thin adapter over the V1 OpenCode SDK.
@@ -15,8 +16,27 @@ export type Session = { id: string; parentID?: string; title: string; directory:
 export class OpenCodeApi {
   constructor(private readonly client: Client, private readonly directory: string) {}
 
-  async create(title: string, signal?: AbortSignal): Promise<Session> {
-    return asSession(unwrap(await this.client.session.create({ body: { title }, query: { directory: this.directory }, signal }), "create session"))
+  async create(title: string, signal?: AbortSignal, options?: { agent?: string; model?: ModelSelection }): Promise<Session> {
+    const body: Record<string, unknown> = { title }
+    if (options?.agent) body.agent = options.agent
+    if (options?.model) body.model = options.model
+    return asSession(unwrap(await this.client.session.create({ body: body as never, query: { directory: this.directory }, signal }), "create session"))
+  }
+
+  async agents(signal?: AbortSignal): Promise<AgentSummary[] | undefined> {
+    const listFn = (this.client as unknown as { agent?: { list?: (opts?: { signal?: AbortSignal }) => Promise<unknown> } }).agent?.list
+    if (typeof listFn !== "function") return undefined
+    const raw = unwrap(await listFn({ signal }), "list agents")
+    if (!Array.isArray(raw)) return undefined
+    return raw
+      .filter(isRecord)
+      .map((entry) => ({
+        id: typeof entry.id === "string" ? entry.id : String(entry.name ?? ""),
+        ...(typeof entry.name === "string" ? { name: entry.name } : {}),
+        ...(typeof entry.mode === "string" ? { mode: entry.mode } : {}),
+        ...(typeof entry.hidden === "boolean" ? { hidden: entry.hidden } : {}),
+      }))
+      .filter((entry) => entry.id.length > 0)
   }
 
   async get(sessionID: string, signal?: AbortSignal): Promise<Session> {

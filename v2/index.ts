@@ -26,13 +26,20 @@ function sessionOf(event: any): string | undefined {
   return data?.sessionID ?? event?.sessionID
 }
 
-/** V2 messages are {id, role, content}; collab's helpers expect {info, parts}. */
+/** V2 messages are {id, type, content/text}; collab's helpers expect {info, parts}. */
 function toV1Message(message: any) {
-  const content = Array.isArray(message?.content) ? message.content : []
+  const role = message?.role ?? message?.type
+  const content = Array.isArray(message?.content)
+    ? message.content
+    : Array.isArray(message?.parts)
+      ? message.parts
+      : typeof message?.text === "string"
+        ? [{ type: "text", text: message.text }]
+        : []
   return {
     info: {
       id: message?.id,
-      role: message?.role,
+      ...(role ? { role } : {}),
       ...(message?.agent ? { agent: message.agent } : {}),
       ...(message?.sessionID ? { sessionID: message.sessionID } : {}),
     },
@@ -79,9 +86,25 @@ export default {
     const running = new Set<string>()
 
     const client = {
+      agent: {
+        list: async () => {
+          const res = typeof ctx.agent?.list === "function" ? await ctx.agent.list() : []
+          return { data: Array.isArray(res) ? res : (res?.data ?? []) }
+        },
+      },
       session: {
         create: async ({ body }: any) => ({
-          data: normalizeSession(await ctx.session.create({ title: body?.title ?? "collab" }), ctx.location?.directory ?? process.cwd()),
+          data: normalizeSession(
+            await ctx.session.create({
+              title: body?.title ?? "collab",
+              ...(body?.agent ? { agent: body.agent } : {}),
+              ...(body?.model?.providerID && body?.model?.modelID
+                ? { model: { providerID: body.model.providerID, id: body.model.modelID } }
+                : {}),
+              ...(ctx.location?.directory ? { location: { directory: ctx.location.directory } } : {}),
+            }),
+            ctx.location?.directory ?? process.cwd(),
+          ),
         }),
         get: async ({ path }: any) => ({
           data: normalizeSession(await ctx.session.get({ sessionID: path.id }), ctx.location?.directory ?? process.cwd()),
@@ -105,14 +128,19 @@ export default {
           if (synthetic) {
             await ctx.session.synthetic({ sessionID: path.id, text })
           } else {
-            await ctx.session.prompt({
-              sessionID: path.id,
-              text,
-              ...(body?.agent ? { agent: body.agent } : {}),
-              ...(body?.model?.providerID && body?.model?.modelID
-                ? { model: { providerID: body.model.providerID, id: body.model.modelID } }
-                : {}),
-            })
+            // V2 `ctx.session.prompt` ignores `agent` and `model` — they live on
+            // the session via `switchAgent` / `switchModel`. Switch agent first,
+            // then model so an agent's default model never overrides explicit choice.
+            if (body?.agent && typeof ctx.session.switchAgent === "function") {
+              await ctx.session.switchAgent({ sessionID: path.id, agent: body.agent })
+            }
+            if (body?.model?.providerID && body?.model?.modelID && typeof ctx.session.switchModel === "function") {
+              await ctx.session.switchModel({
+                sessionID: path.id,
+                model: { providerID: body.model.providerID, id: body.model.modelID },
+              })
+            }
+            await ctx.session.prompt({ sessionID: path.id, text })
           }
           return { data: undefined }
         },
@@ -178,7 +206,16 @@ export default {
             }
             if (type === "session.execution.failed") {
               if (sessionID) running.delete(sessionID)
-              await hooks.event({ event: { type: "session.error", properties: { sessionID } } })
+              const err = dataOf(event)?.error
+              const detail = typeof err?.message === "string"
+                ? `${err.type ? `[${err.type}${err.status ? ` ${err.status}` : ""}] ` : ""}${err.message}`
+                : undefined
+              await hooks.event({
+                event: {
+                  type: "session.error",
+                  properties: { sessionID, ...(detail ? { error: detail } : {}), ...((event as any)?.id ? { eventID: (event as any).id } : {}) },
+                },
+              })
               continue
             }
             if (type === "session.deleted") {

@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import type { Hooks, Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin/tool"
-import { messageID, OpenCodeApi } from "./api.js"
+import { type AgentSummary, messageID, OpenCodeApi } from "./api.js"
 import { CollabRegistry, type ModelSelection, type Peer } from "./registry.js"
 
 type Options = {
@@ -25,11 +25,53 @@ const SESSION = "session:"
 const PANE = "pane:"
 const PANE_SUBS_OPTION = "@collab_subs"
 const PANE_ACTOR_OPTION = "@collab_actor"
+
+type TranscriptMessage = {
+  info?: { id?: unknown; role?: unknown }
+  parts?: Array<{ type?: string; synthetic?: boolean; text?: unknown }>
+}
+
 function messageKey(messages: unknown): string {
   if (!Array.isArray(messages) || messages.length === 0) return "empty"
-  const last = messages[messages.length - 1] as { info?: { id?: unknown }; parts?: unknown }
+  const list = messages as TranscriptMessage[]
+  // Walk backwards so trailing idle/empty markers (OpenCode V2 SessionMessageIdle)
+  // never mask the real completed turn's message id.
+  for (let i = list.length - 1; i >= 0; i--) {
+    const msg = list[i]
+    const hasContent = Array.isArray(msg?.parts) && msg.parts.length > 0
+    if ((msg?.info?.role === "assistant" || hasContent) && typeof msg?.info?.id === "string") {
+      return msg.info.id
+    }
+  }
+  const last = list[list.length - 1]
   if (typeof last?.info?.id === "string") return last.info.id
-  return `count:${messages.length}`
+  return `count:${list.length}`
+}
+
+function resolveAgent(
+  requested: string | undefined,
+  callerAgent: string | undefined,
+  available?: AgentSummary[],
+): string {
+  const trimmed = requested?.trim()
+  if (!trimmed) {
+    const caller = callerAgent?.trim()
+    if (caller) return caller
+    const fallback = available?.find((entry) => !entry.hidden)?.id ?? available?.[0]?.id
+    return fallback || "general"
+  }
+  if (available && available.length > 0) {
+    const exact = available.find((entry) => entry.id === trimmed)
+    if (exact) return exact.id
+    const lower = trimmed.toLowerCase()
+    const fold = available.find((entry) => entry.id.toLowerCase() === lower || entry.name?.toLowerCase() === lower)
+    if (fold) return fold.id
+    throw new Error(
+      `Unknown or unavailable agent "${trimmed}". Choose one of: ${available.map((entry) => entry.id).join(", ")} ` +
+      `(or omit agent to reuse caller's current agent "${callerAgent?.trim() || "default"}").`,
+    )
+  }
+  return trimmed
 }
 
 export function opencodeCollab(overrides: Options = {}): Plugin {
@@ -169,15 +211,26 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
 
     function summaryOf(messages: unknown): string {
       if (!Array.isArray(messages) || messages.length === 0) return ""
-      const last = messages[messages.length - 1] as { parts?: Array<{ type?: string; synthetic?: boolean; text?: unknown }> }
-      const part = last?.parts?.find((candidate) => candidate.type === "text" && !candidate.synthetic)
-      return typeof part?.text === "string" ? part.text.trim() : ""
+      const list = messages as TranscriptMessage[]
+      for (let i = list.length - 1; i >= 0; i--) {
+        const msg = list[i]
+        const role = typeof msg?.info?.role === "string" ? msg.info.role : undefined
+        if (role !== undefined && role !== "assistant") continue
+        const texts = (msg?.parts ?? [])
+          .filter((part) => part.type === "text" && !part.synthetic && typeof part.text === "string" && part.text.trim().length > 0)
+          .map((part) => (part.text as string).trim())
+        if (texts.length > 0) return texts.join("\n\n")
+      }
+      return ""
     }
 
-    async function announceFinish(peer: Peer, reason: "idle" | "error", detail?: string) {
+    async function announceFinish(peer: Peer, reason: "idle" | "error", detail?: string, prefetchedMessages?: unknown) {
       let summary = ""
       if (reason === "idle") {
-        try { summary = summaryOf(await api.messages(peer.sessionID, 4, shutdown.signal)) } catch {}
+        try {
+          const messages = prefetchedMessages ?? await api.messages(peer.sessionID, 10, shutdown.signal)
+          summary = summaryOf(messages)
+        } catch {}
       }
       const model = modelName(peer.model)
       emit(
@@ -188,13 +241,16 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
           `<collab-notify>\n` +
           `Peer session ${peer.sessionID} (agent: ${peer.agent}, model: ${model}) has ${reason === "idle" ? "RETURNED TO IDLE" : "FAILED"}.\n` +
           (detail ? `Error: ${detail}\n` : "") +
-          `Result:\n===\n${summary || "(no assistant text yet — it may not have started, or its last turn produced only tool calls)"}\n===\n` +
+          (reason === "error"
+            ? `Recovery hint: try varying the model (${permittedModels.join(", ")}) or varying the agent (current: ${peer.agent}).\n`
+            : "") +
+          `Result:\n===\n${summary || (reason === "error" ? "(execution failed before producing a final response)" : "(no assistant text yet — it may not have started, or its last turn produced only tool calls)")}\n===\n` +
           `Nothing is required of you: this is the report you subscribed to. Next verbs — ` +
           `collab_read({ to: "${peer.sessionID}" }) for the full transcript, ` +
           `collab_send({ to: "${peer.sessionID}", message: "..." }) to steer it, ` +
           `collab_detach({ resource: "${SESSION}${peer.sessionID}" }) to stop hearing about it.\n` +
           `</collab-notify>`,
-        { agent: peer.agent, model, summary: summary.slice(0, 500) },
+        { agent: peer.agent, model, ...(detail ? { error: detail } : {}), summary: summary.slice(0, 500) },
       )
     }
 
@@ -208,7 +264,25 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
             registry.sent(message.id)
             registry.markActive([message.sessionID], input.directory, Date.now() + lease)
             running.add(message.sessionID)
-          } catch (error) { registry.retry(message.id, message.attempts + 1, errorMessage(error)) }
+          } catch (error) {
+            const errText = errorMessage(error)
+            const nextAttempts = message.attempts + 1
+            registry.retry(message.id, nextAttempts, errText)
+            if (nextAttempts >= 8) {
+              emit(
+                `${SESSION}${message.sessionID}`,
+                "session.error",
+                message.sessionID,
+                () =>
+                  `<collab-notify>\n` +
+                  `Queued message ${message.id} to peer ${message.sessionID} (agent: ${message.agent}, model: ${modelName(message.model)}) FAILED permanently after ${nextAttempts} attempts.\n` +
+                  `Error: ${errText}\n` +
+                  `Recovery hint: try varying the model (${permittedModels.join(", ")}) or agent, or resend with collab_send.\n` +
+                  `</collab-notify>`,
+                { messageID: message.id, error: errText },
+              )
+            }
+          }
         }
       } catch { /* the durable queue is retried by the next tick */ }
     }
@@ -265,13 +339,15 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
         args: {
           tasks: tool.schema.array(tool.schema.object({
             prompt: tool.schema.string().min(1).describe("Instructions or question for the peer agent"),
-            agent: tool.schema.string().min(1).describe("Agent archetype: executor, explore, general, pragmatic-checker, curator, etc."),
+            agent: tool.schema.string().min(1).optional().describe("Agent archetype (executor, explore, general, pragmatic-checker, curator, etc.). Omit to inherit the caller's current agent."),
             model: tool.schema.string().min(3).optional().describe(`Model from the allowed pool. Omit for default (${permittedModels[0]}): ${modelPool}`),
           })).min(1).describe("One or more peer tasks to run in parallel"),
           attach: tool.schema.array(tool.schema.string().min(1)).optional().describe("Resources to subscribe this caller to alongside the spawn, e.g. [\"pane:%3\"]"),
         },
         async execute(args, context) {
           if (registry.isManaged(context.sessionID)) throw new Error("A peer session cannot spawn peers: report to your parent with collab_send instead")
+          let availableAgents: AgentSummary[] | undefined
+          try { availableAgents = await api.agents(context.abort) } catch {}
 
           // Two phases on purpose. Peers are created BEFORE any is prompted, so
           // every peer receives the complete sibling list. Prompting as we went
@@ -280,25 +356,33 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
           // batch spawn.
           type Prepared = { peerID: string; agent: string; model: ModelSelection; prompt: string; admission: string }
           const prepared: Prepared[] = []
-          const failures: Array<{ agent: string; reason: string }> = []
+          const failures: Array<{ agent: string; model?: string; reason: string }> = []
 
           for (const task of args.tasks) {
             const model = selectModel(task.model, settings.models)
+            const agent = resolveAgent(task.agent, context.agent, availableAgents)
             const admission = registry.admit(context.sessionID, settings.maxConcurrent, Date.now() + Math.max(60_000, lease))
-            if (!admission) { failures.push({ agent: task.agent, reason: `Concurrent capacity limit reached (${settings.maxConcurrent}). Close a peer with collab_close, then retry.` }); continue }
+            if (!admission) {
+              failures.push({
+                agent,
+                model: modelName(model),
+                reason: `Concurrent capacity limit reached (${settings.maxConcurrent}). Close a peer with collab_close, then retry.`,
+              })
+              continue
+            }
             try {
-              const peer = await api.create(`🤝 collab:${task.agent} — ${task.prompt.slice(0, 60)}`, context.abort)
+              const peer = await api.create(`🤝 collab:${agent} — ${task.prompt.slice(0, 60)}`, context.abort, { agent, model })
               if (peer.parentID) throw new Error("OpenCode returned a child session; refusing non-peer session")
-              registry.add({ ownerSessionID: context.sessionID, sessionID: peer.id, directory: context.directory, agent: task.agent, model })
+              registry.add({ ownerSessionID: context.sessionID, sessionID: peer.id, directory: context.directory, agent, model })
               if (!registry.reserve(context.sessionID, peer.id, settings.maxConcurrent, Date.now() + lease)) {
                 registry.archive(context.sessionID, peer.id)
                 throw new Error(`Concurrent capacity limit reached (${settings.maxConcurrent}). Close a peer with collab_close, then retry.`)
               }
               // Ownership implies subscription: the parent always hears about its peer.
               registry.subscribe(`${SESSION}${peer.id}`, context.sessionID, "*", 0)
-              prepared.push({ peerID: peer.id, agent: task.agent, model, prompt: task.prompt, admission })
+              prepared.push({ peerID: peer.id, agent, model, prompt: task.prompt, admission })
             } catch (error) {
-              failures.push({ agent: task.agent, reason: errorMessage(error) })
+              failures.push({ agent, model: modelName(model), reason: errorMessage(error) })
               registry.releaseAdmission(admission)
             }
           }
@@ -324,7 +408,10 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
               registry.archive(context.sessionID, item.peerID)
               failures.push({
                 agent: item.agent,
-                reason: `peer ${item.peerID} was archived. Retry with another permitted model: ${modelNames(settings.models).join(", ")}. OpenCode error: ${errorMessage(error)}`,
+                model: modelName(item.model),
+                reason:
+                  `peer ${item.peerID} was archived (agent: ${item.agent}, model: ${modelName(item.model)}). ` +
+                  `Retry with another permitted model: ${modelNames(settings.models).join(", ")}, or vary the agent. OpenCode error: ${errorMessage(error)}`,
               })
             } finally {
               registry.releaseAdmission(item.admission)
@@ -348,18 +435,21 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
         description: `Single-peer alias of collab_spawn. Creates one durable root peer, non-blocking, auto-reported on idle. ${modelPool}`,
         args: {
           prompt: tool.schema.string().min(1),
-          agent: tool.schema.string().min(1),
+          agent: tool.schema.string().min(1).optional().describe("Agent archetype (executor, explore, general, etc.). Omit to inherit the caller's current agent."),
           model: tool.schema.string().min(3).optional().describe(`Optional provider/model-id: ${modelPool}`),
         },
         async execute(args, context) {
           if (registry.isManaged(context.sessionID)) throw new Error("A peer session cannot open peers: report to your parent with collab_send instead")
+          let availableAgents: AgentSummary[] | undefined
+          try { availableAgents = await api.agents(context.abort) } catch {}
           const model = selectModel(args.model, settings.models)
+          const agent = resolveAgent(args.agent, context.agent, availableAgents)
           const admission = registry.admit(context.sessionID, settings.maxConcurrent, Date.now() + Math.max(60_000, lease))
           if (!admission) throw new Error(`Concurrent capacity limit reached (${settings.maxConcurrent}). Close a peer with collab_close, then retry.`)
           try {
-            const peer = await api.create(`🤝 collab:${args.agent} — ${args.prompt.slice(0, 60)}`, context.abort)
+            const peer = await api.create(`🤝 collab:${agent} — ${args.prompt.slice(0, 60)}`, context.abort, { agent, model })
             if (peer.parentID) throw new Error("OpenCode returned a child session; refusing non-peer session")
-            registry.add({ ownerSessionID: context.sessionID, sessionID: peer.id, directory: context.directory, agent: args.agent, model })
+            registry.add({ ownerSessionID: context.sessionID, sessionID: peer.id, directory: context.directory, agent, model })
             if (!registry.reserve(context.sessionID, peer.id, settings.maxConcurrent, Date.now() + lease)) {
               registry.archive(context.sessionID, peer.id)
               throw new Error(`Concurrent capacity limit reached (${settings.maxConcurrent}). Close a peer with collab_close, then retry.`)
@@ -367,17 +457,17 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
             registry.subscribe(`${SESSION}${peer.id}`, context.sessionID, "*", 0)
             const id = messageID()
             try {
-              await api.prompt({ sessionID: peer.id, text: topology(peer, context.sessionID, args.agent, modelName(model)) + args.prompt, agent: args.agent, model, messageID: id }, context.abort)
+              await api.prompt({ sessionID: peer.id, text: topology(peer, context.sessionID, agent, modelName(model)) + args.prompt, agent, model, messageID: id }, context.abort)
             } catch (error) {
               registry.archive(context.sessionID, peer.id)
               throw new Error(
-                `collab_open failed with ${modelName(model)}; peer ${peer.id} was archived. Retry with another permitted model: ` +
-                `${modelNames(settings.models).join(", ")}. OpenCode error: ${errorMessage(error)}`,
+                `collab_open failed (agent: ${agent}, model: ${modelName(model)}); peer ${peer.id} was archived. ` +
+                `Retry with another permitted model: ${modelNames(settings.models).join(", ")}, or vary the agent. OpenCode error: ${errorMessage(error)}`,
               )
             }
             registry.markActive([peer.id], input.directory, Date.now() + lease)
             return json({
-              peerID: peer.id, state: "started", agent: args.agent, model: modelName(model), messageID: id,
+              peerID: peer.id, state: "started", agent, model: modelName(model), messageID: id,
               note: "Non-blocking peer started. You will receive a <collab-notify> with its full result as soon as it returns to idle.",
             })
           } finally { registry.releaseAdmission(admission) }
@@ -639,14 +729,19 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
             try { await api.synthetic(sessionID, text) } catch { for (const entry of deferred) registry.enqueueDeferred(sessionID, entry.text) }
           }
 
-          // 2. Peer completion report — event-driven, exactly one per real turn.
+          // 2. Peer completion report — event-driven, exactly one per real turn
+          // across all plugin instances sharing the SQLite registry.
           const peer = registry.peerOf(sessionID)
           if (peer && !peer.archived) {
-            let key = "empty"
-            try { key = messageKey(await api.messages(sessionID, 4, shutdown.signal)) } catch {}
-            if (lastReported.get(sessionID) !== key) {
+            let messages: unknown
+            let key: string | undefined
+            try {
+              messages = await api.messages(sessionID, 10, shutdown.signal)
+              key = messageKey(messages)
+            } catch {}
+            if (key !== undefined && lastReported.get(sessionID) !== key && registry.claimReport(sessionID, key)) {
               lastReported.set(sessionID, key)
-              await announceFinish(peer, "idle")
+              await announceFinish(peer, "idle", undefined, messages)
             }
           }
 
@@ -658,11 +753,27 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
         if (event.type === "session.error" || event.type === "session.deleted") {
           const peer = registry.peerOf(sessionID)
           if (peer && !peer.archived) {
-            if (event.type === "session.deleted") emit(`${SESSION}${sessionID}`, "session.closed", sessionID, () =>
-              `<collab-notify>\nPeer session ${sessionID} was deleted outside this plugin. Its history is gone; nothing more will arrive from it.\n` +
-              `Next verb: collab_list({ include_archived: true }) to reconcile your peer list.\n</collab-notify>`,
-            )
-            else await announceFinish(peer, "error", "the session reported an error event")
+            if (event.type === "session.deleted") {
+              const delKey = `deleted:${sessionID}`
+              if (lastReported.get(sessionID) !== delKey && registry.claimReport(sessionID, delKey)) {
+                lastReported.set(sessionID, delKey)
+                emit(`${SESSION}${sessionID}`, "session.closed", sessionID, () =>
+                  `<collab-notify>\nPeer session ${sessionID} was deleted outside this plugin. Its history is gone; nothing more will arrive from it.\n` +
+                  `Next verb: collab_list({ include_archived: true }) to reconcile your peer list.\n</collab-notify>`,
+                )
+              }
+            } else {
+              const props = event.properties as { error?: unknown; eventID?: unknown }
+              const detail = typeof props.error === "string" && props.error.length > 0
+                ? props.error
+                : "the session reported an error event"
+              const eventID = typeof props.eventID === "string" ? props.eventID : undefined
+              const errKey = eventID ? `error:${eventID}` : undefined
+              if (!errKey || (lastReported.get(sessionID) !== errKey && registry.claimReport(sessionID, errKey))) {
+                if (errKey) lastReported.set(sessionID, errKey)
+                await announceFinish(peer, "error", detail)
+              }
+            }
           }
           await flushSession(sessionID)
         }

@@ -125,4 +125,29 @@ describe("collaboration edges", () => {
     db.markActive(["peer-1"], "/work", Date.now() + 10_000)
     expect(db.subscriptions("session:peer-1", "parent-a")[0].sessionID).toBe("parent-a")
   })
+
+  test("claimReport deduplicates across instances sharing one sqlite file", async () => {
+    const path = `/tmp/opencode/collab-claim-${crypto.randomUUID()}.sqlite`
+    const first = new CollabRegistry(path)
+    const second = new CollabRegistry(path)
+    try {
+      first.add(peer())
+      expect(first.claimReport("peer-1", "msg_1")).toBe(true)
+      expect(second.claimReport("peer-1", "msg_1")).toBe(false)
+      expect(second.claimReport("peer-1", "msg_2")).toBe(true)
+      expect(first.claimReport("peer-1", "msg_2")).toBe(false)
+    } finally {
+      first.close()
+      second.close()
+    }
+  })
+
+  test("file-backed registry transparently reopens after close()", () => {
+    const path = `/tmp/opencode/collab-reopen-${crypto.randomUUID()}.sqlite`
+    const db = new CollabRegistry(path)
+    db.add(peer())
+    db.close()
+    expect(db.owned("parent-a", "peer-1")?.agent).toBe("build")
+    db.close()
+  })
 })
