@@ -4,7 +4,7 @@ import { join } from "node:path"
 import type { Hooks, Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin/tool"
 import { type AgentSummary, messageID, OpenCodeApi } from "./api.js"
-import { CollabRegistry, type ModelSelection, type Peer } from "./registry.js"
+import { CollabRegistry, type ModelSelection } from "./registry.js"
 
 type Options = {
   databasePath?: string
