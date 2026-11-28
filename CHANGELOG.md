@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.1.1 — 2026-11-28
+
+### V2 host hardening (`v2/index.ts`)
+
+Five gaps in the V2 adapter could leave a session stuck "busy" forever, drop a
+completion report silently, or corrupt the admitted prompt. All are fixed at the
+adapter boundary; the V1 engine is untouched.
+
+- **`session.execution.aborted` / `session.execution.interrupted`** now free the
+  `running` set and reach subscribers as `session.error`. Previously
+  `session.status` reported such a session as busy forever, which blocked every
+  subsequent queued message to it (the pump skips active sessions).
+- **`promptAsync` failures** (`switchAgent`, `switchModel`, `ctx.session.prompt`,
+  and the synthetic delivery) now clear `running` and emit `session.error`
+  before rethrowing, so a failed notice stays durable without leaving a stale
+  busy entry behind. Reports are de-duplicated per session until a success, which
+  kills the error → notice → error ping-pong.
+- **`ctx.event.subscribe`** is no longer a fire-and-forget subscription with a
+  silent `catch {}`: a dropped or ended stream logs, reports, and resubscribes
+  with exponential backoff (200 ms → 5 s), exiting immediately on disposal.
+- **`chat.message`** runs inside `try/catch` against a cloned draft of the prompt,
+  so a throwing or mutating hook can neither corrupt `event.prompt` nor break the
+  turn. Single-part and multi-part prompts both write back only the text parts,
+  leaving non-text parts intact.
+- **Dead recipients are terminal.** When a wake-up fails and the session is gone
+  (`404` / `not found` / `gone` / `deleted`), the adapter emits `session.deleted`
+  so V1 releases its subscriptions and reports success so the durable notice is
+  dropped instead of retried forever. Ambiguous transport errors stay retryable,
+  so normal parent wake-ups are unaffected.
+
+`tests/v2.test.ts` covers all five: aborted/interrupted clearing `running`,
+prompt/switchAgent failures, reconnect-with-backoff, prompt-hook safety, and the
+dead-vs-transient delivery distinction (63 tests, 5 files).
+
 ## 1.1.0 — 2026-11-18
 
 ### OpenCode 2 support (`v2/index.ts`)

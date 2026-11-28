@@ -617,7 +617,7 @@ export function opencodeCollab(overrides: Options = {}): Plugin {
       collab_defer: tool({
         description:
           "OPERATOR ONLY. Queue a prompt to run at the very end of the current turn, when the session is fully idle. " +
-          "Agents must never call this: it is the Ctrl+Enter escape hatch, owned by KπX.",
+          "Agents must never call this: it is the Ctrl+Enter escape hatch, owned by the operator.",
         args: { text: tool.schema.string().min(1).describe("Prompt text to execute after the current turn finishes") },
         async execute(args, context) {
           const id = registry.enqueueDeferred(context.sessionID, args.text)

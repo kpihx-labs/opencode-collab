@@ -43,6 +43,18 @@ Resources:
 - **Exact de-duplication.** A completion report is keyed by the peer's last
   message id: an idle burst on an unchanged transcript is one report, and a
   genuinely new turn is always a new report.
+- **Every termination is reported.** `succeeded`, `failed`, `aborted` and
+  `interrupted` all free the session's busy slot and reach subscribers; a turn
+  that ends by cancellation is never mistaken for a session that is still busy.
+- **Dead recipients are terminal, ambiguous failures are not.** A wake-up that
+  proves the session no longer exists (`404` / `not found` / `gone` / `deleted`)
+  emits `session.deleted` (releasing subscriptions) and drops the notice; any
+  other delivery failure is reported and retried. Both clear the busy slot.
+- **Never silently deaf.** A dropped event stream is logged, reported and
+  resubscribed with exponential backoff (200 ms → 5 s) until the plugin is
+  disposed — the busy set can never be left frozen by a transient outage.
+- **A broken prompt hook cannot corrupt a prompt.** The `chat.message` hook runs
+  against a cloned draft; only text parts are written back, and only on success.
 
 ## Authorization
 
